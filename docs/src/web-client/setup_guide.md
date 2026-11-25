@@ -9,39 +9,52 @@ This guide covers the configuration required to use the Miden web SDK (`@miden-s
 
 ## Prerequisites
 
-- Node.js 20+ (Node 22+ requires an extra `localStorage` polyfill — see below)
+- Node.js 20.9+ for the current Next.js template; see the `localStorage` compatibility workaround below if needed
+- Next.js 14+ with App Router
 - yarn or npm
 
 ## Create a tutorial project
 
-Most Web Client tutorials use a Next.js application with TypeScript:
+The Web Client tutorials start from a Next.js application with TypeScript:
 
 ```bash
 npx create-next-app@latest miden-web-app --typescript
 cd miden-web-app
 ```
 
-Accept the default prompts unless the tutorial asks for a different project name or framework.
+Hit enter for all terminal prompts, and use the project name the tutorial asks for if it differs.
+
+The current Next.js template uses Turbopack by default, while these examples use the webpack
+configuration below, so point both scripts in `package.json` at webpack:
+
+`package.json`
+
+```json
+{
+  "scripts": {
+    "dev": "next dev --webpack",
+    "build": "next build --webpack"
+  }
+}
+```
 
 ## Install the SDK
 
 ```bash
-yarn add @miden-sdk/miden-sdk
+yarn add @miden-sdk/miden-sdk@0.17.1
 ```
 
 For React hook support:
 
 ```bash
-yarn add @miden-sdk/react
+yarn add @miden-sdk/miden-sdk@0.17.1 @miden-sdk/react@0.17.0
 ```
 
 These tutorials use Next.js, so all code examples import from the SDK's `/lazy` subpath — see [Entry points: eager vs lazy](#entry-points-eager-vs-lazy) below for why that's required.
 
 ## Next.js Configuration
 
-The Next.js tutorials assume Next.js 14+ with App Router.
-
-Create or update `next.config.ts` with these required settings:
+Create or update `next.config.ts` with these required settings. With Next.js 16 or newer, use `next dev --webpack` and `next build --webpack` so this webpack callback runs. The repository’s Next.js 15 app uses webpack by default.
 
 ```ts
 import type { NextConfig } from 'next';
@@ -75,16 +88,6 @@ const nextConfig: NextConfig = {
 };
 
 export default nextConfig;
-```
-
-Then update the development script in `package.json` to use webpack:
-
-```json
-{
-  "scripts": {
-    "dev": "next dev --webpack"
-  }
-}
 ```
 
 ### Importing `.masm` files (for smart contract tutorials)
@@ -131,9 +134,7 @@ export async function doSomething() {
   if (typeof window === 'undefined') return;
   await MidenClient.ready();
   // Safe to construct wasm-bindgen types from here.
-  const client = await MidenClient.create({
-    rpcUrl: 'https://rpc.testnet.miden.io',
-  });
+  const client = await MidenClient.createTestnet();
   // …
 }
 ```
@@ -142,15 +143,16 @@ In React, the `@miden-sdk/react/lazy` provider manages WASM readiness for you vi
 
 ```tsx
 import { useMiden, useCreateWallet } from '@miden-sdk/react/lazy';
+import { getWasmOrThrow } from '@miden-sdk/miden-sdk/lazy';
 
 function Component() {
   const { isReady } = useMiden();
   const { createWallet } = useCreateWallet();
   return (
     <button
-      onClick={() =>
+      onClick={async () =>
         createWallet({
-          /* … */
+          authScheme: (await getWasmOrThrow()).AuthScheme.AuthRpoFalcon512,
         })
       }
       disabled={!isReady}
@@ -167,15 +169,50 @@ Never construct wasm-bindgen types (`AccountId`, `Note`, `createP2IDNote`, `Tran
 
 :::
 
+## Network and fee setup
+
+The v0.17 examples use testnet by default. Run them with `yarn tutorials --web`
+from the repository root; add `--web=react:createMintConsume` to select a React example.
+For explicit devnet testing, run `TUTORIAL_NETWORK=devnet yarn tutorials --web`.
+
+Use a fresh browser database when upgrading from 0.16: persisted accounts, notes,
+and scripts are incompatible with 0.17. The examples pair core SDK 0.17.1 with
+React SDK 0.17.0. Fee configuration comes from the node during sync; read the
+native faucet with `await client.feeFaucetId()` after syncing.
+
+The examples use the selected network's remote prover. Browser local proving can
+exceed the 20-block transaction expiry imposed by native-token policies. To try
+local proving on a sufficiently fast device, pass `proverUrl: 'local'` to
+`createTutorialClient`, or `prover: 'local'` to `MidenProvider`.
+
+New accounts need the native fee asset before executing transactions. The examples
+request a public P2ID note from the faucet and consume it as their first transaction,
+paying that transaction's fee from the input note. User-created faucets include
+`BasicWallet`, so they can receive fee funding too. The SDK supplies native
+fee-conversion data automatically.
+
+Copy `web-client/lib/feeSupport.ts` with the complete TypeScript examples and
+`web-client/lib/react/tutorialSupport.tsx` with React examples. These repository
+helpers fund accounts, synchronize state, and await confirmation. They select
+application notes by ID or token and exclude `TX_FEE` notes (tag `0xFEE`).
+
+The React helper's `tutorialAuthScheme()` returns the low-level Falcon enum
+required by wallet and faucet hooks; it differs from the high-level client enum.
+
+The faucet URL and funding amount default to the selected network's faucet and its advertised
+`base_amount`. Override them with `NEXT_PUBLIC_MIDEN_FAUCET_URL` and
+`NEXT_PUBLIC_MIDEN_FEE_AMOUNT`, or `MIDEN_FAUCET_URL` and `MIDEN_FEE_AMOUNT` in the
+repository runner. `NEXT_PUBLIC_MIDEN_NETWORK` selects the network when running the app directly.
+
 ## Node.js 22+ `localStorage` polyfill
 
-If you run `next dev` under Node.js 22 or later, every page request will crash with:
+Some Node.js and Next.js combinations fail in the development overlay with:
 
 ```
 TypeError: localStorage.getItem is not a function
 ```
 
-This is a Node + Next.js interaction, not a Miden SDK issue. Node 22+ defines `globalThis.localStorage` as an object, but its methods (`getItem`, `setItem`, …) are undefined unless Node is launched with `--localstorage-file`. Next.js's dev overlay guards with `typeof localStorage !== 'undefined'`, which passes on Node 22+, and then calls the missing methods.
+The workaround below handles a server-side `localStorage` object that lacks the methods the development overlay expects. Apply it if you encounter this error; it is not a requirement for every Node.js 22+ installation.
 
 Add this polyfill at the top of `next.config.ts`, before the config object:
 
@@ -202,22 +239,23 @@ Add this polyfill at the top of `next.config.ts`, before the config object:
 }
 ```
 
-This only affects `next dev` (SSR); static exports via `next build` are unaffected. The polyfill is harmless on Node ≤21 — it installs an in-memory stub that the dev overlay uses just like Node 22+'s (broken) built-in.
+This fallback supplies in-memory storage to server-side tooling. It does not persist application data and does not replace the browser's storage.
 
 ## SDK API Patterns
 
 ### Transaction return types
 
-All transaction methods return an object, not a plain transaction ID:
+Transaction calls return an object containing the ID and result. In these fragments, `mintOptions` and `sendOptions` are the parameter objects built with your funded accounts and token, as shown in the mint-and-transfer tutorial:
 
 ```ts
 // mint and consume return { txId, result }
-const { txId } = await client.transactions.mint({ ... });
+const { txId: mintTxId, result: mintResult } =
+  await client.transactions.mint(mintOptions);
 
 // send returns { txId, note, result }
 // note is non-null when returnNote: true
-const { txId, note } = await client.transactions.send({
-  ...,
+const { txId: sendTxId, note } = await client.transactions.send({
+  ...sendOptions,
   returnNote: true,
 });
 ```
@@ -229,12 +267,12 @@ You can wait for a transaction to be committed in two ways:
 ```ts
 // Option 1: Pass waitForConfirmation in the transaction call
 await client.transactions.mint({
-  ...,
+  ...mintOptions,
   waitForConfirmation: true,
 });
 
 // Option 2: Wait separately using waitFor
-const { txId } = await client.transactions.mint({ ... });
+const { txId } = await client.transactions.mint(mintOptions);
 await client.transactions.waitFor(txId); // accepts TransactionId object or hex string
 ```
 
@@ -243,7 +281,7 @@ await client.transactions.waitFor(txId); // accepts TransactionId object or hex 
 When displaying transaction IDs in explorer links, call `.toHex()`:
 
 ```ts
-const { txId } = await client.transactions.mint({ ... });
+const { txId } = await client.transactions.mint(mintOptions);
 console.log(`https://testnet.midenscan.com/tx/${txId.toHex()}`);
 ```
 

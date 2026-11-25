@@ -7,6 +7,13 @@ sidebar_position: 7
 
 _Using foreign procedure invocation to craft read-only cross-contract calls with the Miden client_
 
+:::note v0.17 setup
+
+Follow the [network and fee setup](./setup_guide.md#network-and-fee-setup)
+and copy the shared support files imported by the complete example.
+
+:::
+
 ## Overview
 
 In the previous tutorial we deployed a fresh counter smart contract and incremented its count with a transaction script.
@@ -33,13 +40,20 @@ The diagram above depicts the "count copy" smart contract using foreign procedur
 
 ## Prerequisites
 
-Complete the [Web Client Setup Guide](./setup_guide.md) before starting. It covers the Node.js version, package manager, SDK install, and Next.js configuration used by this tutorial.
+- Node `v20` or greater
+- Familiarity with TypeScript
+- `yarn`
 
 This tutorial assumes you have a basic understanding of Miden assembly and completed the previous tutorial on incrementing the counter contract. To quickly get up to speed with Miden assembly (MASM), please play around with running basic Miden assembly programs in the [Miden playground](https://0xmiden.github.io/examples/).
 
 ## Step 1: Initialize your Next.js project
 
-Follow the [setup guide](./setup_guide.md#create-a-tutorial-project) to create the Next.js app and install the SDK. You can use `miden-fpi-app` as the project name if you want to keep this tutorial separate from the earlier ones.
+1. Create the Next.js project by following [Create a tutorial project](./setup_guide.md#create-a-tutorial-project) in the setup guide, using `miden-fpi-app` as the project name. Keep your terminal in that directory for the remaining steps.
+
+2. Install the Miden SDK:
+   ```bash
+   yarn add @miden-sdk/miden-sdk@0.17.1
+   ```
 
 ## Step 2: Edit the `app/page.tsx` file
 
@@ -98,35 +112,53 @@ Create the file `lib/masm/counter_contract.masm`. This is the same counter contr
 ```masm
 use miden::protocol::active_account
 use miden::protocol::native_account
-use miden::core::word
 use miden::core::sys
+
+# CONSTANTS
+# =================================================================================================
 
 const COUNTER_SLOT = word("miden::tutorials::counter")
 
-#! Inputs:  []
-#! Outputs: [count]
-pub proc get_count
+# PUBLIC INTERFACE
+# =================================================================================================
+
+#! Returns the current count.
+#!
+#! Inputs:  [pad(16)]
+#! Outputs: [count, pad(15)]
+#!
+#! Invocation: call
+@account_procedure
+pub proc get_count() -> felt
     push.COUNTER_SLOT[0..2] exec.active_account::get_item
-    # => [count]
+    # => [[count, 0, 0, 0], pad(16)]
 
     exec.sys::truncate_stack
-    # => [count]
+    # => [count, pad(15)]
 end
 
-#! Inputs:  []
-#! Outputs: []
-pub proc increment_count
+#! Increments the current count by one.
+#!
+#! Inputs:  [pad(16)]
+#! Outputs: [pad(16)]
+#!
+#! Invocation: call
+@account_procedure
+pub proc increment_count()
     push.COUNTER_SLOT[0..2] exec.active_account::get_item
-    # => [count]
+    # => [[count, 0, 0, 0], pad(16)]
 
     add.1
-    # => [count+1]
+    # => [[count + 1, 0, 0, 0], pad(16)]
 
     push.COUNTER_SLOT[0..2] exec.native_account::set_item
-    # => []
+    # => [OLD_VALUE, pad(16)]
+
+    dropw
+    # => [pad(16)]
 
     exec.sys::truncate_stack
-    # => []
+    # => [pad(16)]
 end
 ```
 
@@ -135,30 +167,56 @@ end
 Create the file `lib/masm/count_reader.masm`. This is the new "count copy" contract that reads the counter value via FPI and stores it locally:
 
 ```masm
-use miden::protocol::active_account
 use miden::protocol::native_account
 use miden::protocol::tx
-use miden::core::word
 use miden::core::sys
+use {AccountId, AccountProcedureRoot} from miden::protocol::types
+
+# CONSTANTS
+# =================================================================================================
 
 const COUNT_READER_SLOT = word("miden::tutorials::count_reader")
 
-# => [account_id_suffix, account_id_prefix, PROC_HASH(4), foreign_procedure_inputs(16)]
-pub proc copy_count
+# PUBLIC INTERFACE
+# =================================================================================================
+
+#! Copies the count returned by the foreign counter into this account's storage.
+#!
+#! Inputs:  [foreign_account_id_{suffix,prefix}, FOREIGN_PROC_ROOT, pad(10)]
+#! Outputs: [pad(16)]
+#!
+#! Where:
+#! - foreign_account_id_{suffix,prefix} identifies the public counter account.
+#! - FOREIGN_PROC_ROOT is the root of its get_count procedure.
+#!
+#! Invocation: call
+@account_procedure
+@locals(6)
+pub proc copy_count(foreign_account_id: AccountId, foreign_proc_root: AccountProcedureRoot)
+    # save the foreign target while preparing its sixteen zero inputs
+    loc_store.4 loc_store.5 loc_storew_le.0 dropw
+    # => [pad(16)]
+
+    padw padw padw padw
+    # => [foreign_procedure_inputs(16), pad(16)]
+
+    padw loc_loadw_le.0 loc_load.5 loc_load.4
+    # => [foreign_account_id_suffix, foreign_account_id_prefix, FOREIGN_PROC_ROOT, foreign_procedure_inputs(16), pad(16)]
+
     exec.tx::execute_foreign_procedure
-    # => [count, pad(12)]
+    # => [[count, 0, 0, 0], pad(28)]
 
     push.COUNT_READER_SLOT[0..2]
-    # [slot_id_prefix, slot_id_suffix, count, pad(12)]
+    # => [slot_id_suffix, slot_id_prefix, [count, 0, 0, 0], pad(28)]
 
     exec.native_account::set_item
-    # => [OLD_VALUE, pad(12)]
+    # => [OLD_VALUE, pad(28)]
 
-    dropw dropw dropw dropw
-    # => []
+    dropw
+    # => [pad(28)]
 
     exec.sys::truncate_stack
-    # => []
+    # => [pad(16)]
 end
 ```
 
@@ -180,17 +238,11 @@ We need to tell our bundler to treat `.masm` files as plain text strings. In Nex
 Open `next.config.ts` and add the highlighted rule inside the `webpack` callback:
 
 ```ts
-webpack: (config, { isServer }) => {
-  // ... existing WASM config ...
-
-  // Import .masm files as strings
-  config.module.rules.push({
-    test: /\.masm$/,
-    type: "asset/source",
-  });
-
-  return config;
-},
+// Import .masm files as strings. Keep the existing WASM configuration.
+config.module.rules.push({
+  test: /\.masm$/,
+  type: "asset/source",
+});
 ```
 
 :::tip Other bundlers
@@ -215,11 +267,14 @@ import counterContractCode from './masm/counter_contract.masm';
 import countReaderCode from './masm/count_reader.masm';
 import {
   AuthSecretKey,
-  StorageMode,
   StorageSlot,
   StorageResult,
-  MidenClient,
 } from '@miden-sdk/miden-sdk/lazy';
+import {
+  createFundableContractAccount,
+  createTutorialClient,
+  fundAccountForFees,
+} from './feeSupport';
 
 export async function foreignProcedureInvocation(): Promise<void> {
   if (typeof window === 'undefined') {
@@ -227,12 +282,7 @@ export async function foreignProcedureInvocation(): Promise<void> {
     return;
   }
 
-  // Wait for the WASM module to finish initializing before touching any
-  // wasm-bindgen type (see setup_guide.md "Entry points: eager vs lazy").
-  await MidenClient.ready();
-
-  const nodeEndpoint = 'https://rpc.testnet.miden.io';
-  const client = await MidenClient.create({ rpcUrl: nodeEndpoint });
+  const client = await createTutorialClient();
   console.log('Current block number: ', (await client.sync()).blockNum());
 
   const counterSlotName = 'miden::tutorials::counter';
@@ -252,21 +302,38 @@ export async function foreignProcedureInvocation(): Promise<void> {
   crypto.getRandomValues(counterSeed);
   const counterAuth = AuthSecretKey.rpoFalconWithRNG(counterSeed);
 
-  const counterAccount = await client.accounts.create({
-    storage: StorageMode.Public,
-    seed: counterSeed,
-    auth: counterAuth,
-    components: [counterComponent],
-  });
+  const counterAccount = await createFundableContractAccount(
+    client,
+    counterSeed,
+    counterAuth,
+    [counterComponent],
+  );
+
+  await fundAccountForFees(client, counterAccount);
 
   // Deploy the counter to the node by executing a transaction on it
   const deployScript = await client.compile.txScript({
     code: `
-      use external_contract::counter_contract
-      begin
-        call.counter_contract::increment_count
-      end
-    `,
+use external_contract::counter_contract
+
+#! Increments the counter.
+#!
+#! Inputs:  [ARGS, pad(12)]
+#! Outputs: [pad(16)]
+#!
+#! Where:
+#! - ARGS contains unused transaction script arguments.
+#!
+#! Invocation: dyncall
+@transaction_script
+pub proc main(args: word)
+    dropw
+    # => [pad(16)]
+
+    call.counter_contract::increment_count
+    # => [pad(16)]
+end
+`,
     libraries: [
       {
         namespace: 'external_contract::counter_contract',
@@ -277,10 +344,12 @@ export async function foreignProcedureInvocation(): Promise<void> {
 
   // Wait for the deploy transaction to be committed to a block
   // before using it as a foreign account in FPI
+  await client.sync();
   await client.transactions.execute({
     account: counterAccount,
     script: deployScript,
     waitForConfirmation: true,
+    timeout: 120_000,
   });
   console.log('Counter contract ID:', counterAccount.id().toString());
 
@@ -298,12 +367,14 @@ export async function foreignProcedureInvocation(): Promise<void> {
   crypto.getRandomValues(readerSeed);
   const readerAuth = AuthSecretKey.rpoFalconWithRNG(readerSeed);
 
-  const countReaderAccount = await client.accounts.create({
-    storage: StorageMode.Public,
-    seed: readerSeed,
-    auth: readerAuth,
-    components: [countReaderComponent],
-  });
+  const countReaderAccount = await createFundableContractAccount(
+    client,
+    readerSeed,
+    readerAuth,
+    [countReaderComponent],
+  );
+
+  await fundAccountForFees(client, countReaderAccount);
 
   console.log('Count reader contract ID:', countReaderAccount.id().toString());
 
@@ -317,11 +388,21 @@ export async function foreignProcedureInvocation(): Promise<void> {
   const getCountProcHash = counterComponent.getProcedureHash('get_count');
 
   const fpiScriptCode = `
-    use external_contract::count_reader_contract
-    use miden::core::sys
+use external_contract::count_reader_contract
+use miden::core::sys
 
-    begin
-    padw padw padw padw
+#! Copies a public counter through the reader account.
+#!
+#! Inputs:  [ARGS, pad(12)]
+#! Outputs: [pad(16)]
+#!
+#! Where:
+#! - ARGS contains unused transaction script arguments.
+#!
+#! Invocation: dyncall
+@transaction_script
+pub proc main(args: word)
+    dropw
     # => [pad(16)]
 
     push.${getCountProcHash}
@@ -334,12 +415,11 @@ export async function foreignProcedureInvocation(): Promise<void> {
     # => [account_id_suffix, account_id_prefix, GET_COUNT_HASH, pad(16)]
 
     call.count_reader_contract::copy_count
-    # => []
+    # => [pad(16)]
 
     exec.sys::truncate_stack
-    # => []
-
-    end
+    # => [pad(16)]
+end
 `;
 
   const script = await client.compile.txScript({
@@ -352,11 +432,15 @@ export async function foreignProcedureInvocation(): Promise<void> {
     ],
   });
 
-  await client.transactions.execute({
+  await client.sync();
+  const { txId } = await client.transactions.execute({
     account: countReaderAccount,
     script,
     foreignAccounts: [counterAccount],
+    waitForConfirmation: true,
+    timeout: 120_000,
   });
+  console.log(`Transaction committed: ${txId.toHex()}`);
 
   const updatedCountReader = await client.accounts.get(countReaderAccount);
   // `getItem()` is typed to return a low-level `Word`, but at runtime the SDK
@@ -368,7 +452,11 @@ export async function foreignProcedureInvocation(): Promise<void> {
 
   if (countReaderStorage) {
     const countValue = Number(countReaderStorage.toBigInt());
+    if (countValue !== 1)
+      throw new Error(`Expected copied counter 1, got ${countValue}`);
     console.log('Count copied via Foreign Procedure Invocation:', countValue);
+  } else {
+    throw new Error('Count reader storage was not available after commitment');
   }
 
   console.log('\nForeign Procedure Invocation Transaction completed!');
@@ -405,30 +493,56 @@ Foreign Procedure Invocation Transaction completed!
 The count reader smart contract contains a `copy_count` procedure that uses `tx::execute_foreign_procedure` to call the `get_count` procedure in the counter contract.
 
 ```masm
-use miden::protocol::active_account
 use miden::protocol::native_account
 use miden::protocol::tx
-use miden::core::word
 use miden::core::sys
+use {AccountId, AccountProcedureRoot} from miden::protocol::types
+
+# CONSTANTS
+# =================================================================================================
 
 const COUNT_READER_SLOT = word("miden::tutorials::count_reader")
 
-# => [account_id_suffix, account_id_prefix, PROC_HASH(4), foreign_procedure_inputs(16)]
-pub proc copy_count
+# PUBLIC INTERFACE
+# =================================================================================================
+
+#! Copies the count returned by the foreign counter into this account's storage.
+#!
+#! Inputs:  [foreign_account_id_{suffix,prefix}, FOREIGN_PROC_ROOT, pad(10)]
+#! Outputs: [pad(16)]
+#!
+#! Where:
+#! - foreign_account_id_{suffix,prefix} identifies the public counter account.
+#! - FOREIGN_PROC_ROOT is the root of its get_count procedure.
+#!
+#! Invocation: call
+@account_procedure
+@locals(6)
+pub proc copy_count(foreign_account_id: AccountId, foreign_proc_root: AccountProcedureRoot)
+    # save the foreign target while preparing its sixteen zero inputs
+    loc_store.4 loc_store.5 loc_storew_le.0 dropw
+    # => [pad(16)]
+
+    padw padw padw padw
+    # => [foreign_procedure_inputs(16), pad(16)]
+
+    padw loc_loadw_le.0 loc_load.5 loc_load.4
+    # => [foreign_account_id_suffix, foreign_account_id_prefix, FOREIGN_PROC_ROOT, foreign_procedure_inputs(16), pad(16)]
+
     exec.tx::execute_foreign_procedure
-    # => [count, pad(12)]
+    # => [[count, 0, 0, 0], pad(28)]
 
     push.COUNT_READER_SLOT[0..2]
-    # [slot_id_prefix, slot_id_suffix, count, pad(12)]
+    # => [slot_id_suffix, slot_id_prefix, [count, 0, 0, 0], pad(28)]
 
     exec.native_account::set_item
-    # => [OLD_VALUE, pad(12)]
+    # => [OLD_VALUE, pad(28)]
 
-    dropw dropw dropw dropw
-    # => []
+    dropw
+    # => [pad(28)]
 
     exec.sys::truncate_stack
-    # => []
+    # => [pad(16)]
 end
 ```
 
@@ -437,10 +551,10 @@ To call the `get_count` procedure, we push its hash along with the counter contr
 The stack state before calling `tx::execute_foreign_procedure` should look like this:
 
 ```
-# => [account_id_suffix, account_id_prefix, PROC_HASH(4), foreign_procedure_inputs(16)]
+# => [foreign_account_id_suffix, foreign_account_id_prefix, FOREIGN_PROC_ROOT, foreign_procedure_inputs(16), pad(16)]
 ```
 
-`execute_foreign_procedure` always requires exactly 16 `foreign_procedure_inputs` on the stack below the procedure hash and account ID. Since `get_count` takes no arguments, we pass 16 zero words (`padw padw padw padw`) as the inputs.
+`execute_foreign_procedure` always requires exactly 16 `foreign_procedure_inputs` on the stack below the procedure hash and account ID. Since `get_count` takes no arguments, `copy_count` prepares 16 zero field elements (four words: `padw padw padw padw`) as the inputs. The transaction script only passes the account ID and procedure root; the reader saves them in local memory while preparing those inputs.
 
 After calling the `get_count` procedure in the counter contract, we save the count into the
 `miden::tutorials::count_reader` storage slot.
@@ -453,8 +567,18 @@ The transaction script that executes the foreign procedure invocation looks like
 use external_contract::count_reader_contract
 use miden::core::sys
 
-begin
-    padw padw padw padw
+#! Copies a public counter through the reader account.
+#!
+#! Inputs:  [ARGS, pad(12)]
+#! Outputs: [pad(16)]
+#!
+#! Where:
+#! - ARGS contains unused transaction script arguments.
+#!
+#! Invocation: dyncall
+@transaction_script
+pub proc main(args: word)
+    dropw
     # => [pad(16)]
 
     push.${getCountProcHash}
@@ -467,19 +591,20 @@ begin
     # => [account_id_suffix, account_id_prefix, GET_COUNT_HASH, pad(16)]
 
     call.count_reader_contract::copy_count
-    # => []
+    # => [pad(16)]
 
     exec.sys::truncate_stack
-    # => []
+    # => [pad(16)]
 end
 ```
 
 This script:
 
-1. Pushes the procedure hash of the `get_count` function
-2. Pushes the counter contract's account ID suffix and prefix
-3. Calls the `copy_count` procedure in our count reader contract
-4. Truncates the stack
+1. Discards the unused transaction script arguments.
+2. Pushes the procedure root of `get_count`.
+3. Pushes the counter account ID prefix, then suffix, leaving the suffix on top.
+4. Calls `copy_count`, which prepares the foreign call and stores the result.
+5. Truncates the stack.
 
 ## Key Miden Client Concepts for FPI
 
@@ -521,6 +646,8 @@ await client.transactions.execute({
   account: countReaderAccount,
   script,
   foreignAccounts: [counterAccount],
+  waitForConfirmation: true,
+  timeout: 120_000,
 });
 ```
 
@@ -545,21 +672,24 @@ To run a full working example navigate to the `web-client` directory in the [mid
 ```bash
 cd web-client
 yarn install
-yarn start
+yarn dev
 ```
 
 ### Resetting the `MidenClientDB`
 
-The Miden webclient stores account and note data in the browser. If you get errors such as "Failed to build MMR", then you should reset the Miden webclient store. When switching between Miden networks such as from localhost to testnet be sure to reset the browser store. To clear the account and node data in the browser, paste this code snippet into the browser console:
+The Miden webclient stores account and note data in IndexedDB. Stop or terminate the tutorial client and close other tabs using its store before resetting it. This deletes local account data and keys, so use it only for disposable tutorial accounts. The following browser-console snippet deletes the default testnet `MidenClientDB_mtst` store after the deletion request completes; change `name` if you configured a different store.
 
 ```javascript
 (async () => {
-  const dbs = await indexedDB.databases();
-  for (const db of dbs) {
-    await indexedDB.deleteDatabase(db.name);
-    console.log(`Deleted database: ${db.name}`);
-  }
-  console.log('All databases deleted.');
+  const name = 'MidenClientDB_mtst';
+  await new Promise((resolve, reject) => {
+    const request = indexedDB.deleteDatabase(name);
+    request.onsuccess = () => resolve();
+    request.onerror = () => reject(request.error);
+    request.onblocked = () =>
+      reject(new Error('Close clients and tabs using this store, then retry.'));
+  });
+  console.log(`Deleted database: ${name}`);
 })();
 ```
 

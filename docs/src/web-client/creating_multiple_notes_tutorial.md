@@ -7,13 +7,22 @@ import { CodeSdkTabs } from '@site/src/components';
 
 _Using the Miden client in TypeScript to create several P2ID notes in a single transaction_
 
+:::note v0.17 setup
+
+Follow the [network and fee setup](./setup_guide.md#network-and-fee-setup)
+and copy the shared support files imported by the complete example.
+For React snippets, initialize `authScheme` with `await tutorialAuthScheme()`
+as shown in the complete example.
+
+:::
+
 ## Overview
 
 In the previous sections we learned how to create accounts, deploy faucets, and mint tokens. In this tutorial we will:
 
 - **Mint** test tokens from a faucet to Alice
 - **Consume** the minted notes so the assets appear in Alice's wallet
-- **Create three P2ID notes in a _single_ transaction** using a custom note‑script and delegated proving
+- **Create three P2ID notes in a _single_ transaction** using standard P2ID notes and delegated proving
 
 The entire flow is wrapped in a helper called `multiSendWithDelegatedProver()` that you can call from any browser page.
 
@@ -25,15 +34,17 @@ The entire flow is wrapped in a helper called `multiSendWithDelegatedProver()` t
 
 ## Prerequisites
 
-Complete the [Web Client Setup Guide](./setup_guide.md) before starting. It covers the Node.js version, package manager, SDK install, and Next.js configuration used by this tutorial.
+- Node `v20` or greater
+- Familiarity with TypeScript
+- `yarn`
 
 ## What is Delegated Proving?
 
 Before diving into our code example, let's clarify what in the world "delegated proving" actually is.
 
-Delegated proving is the process of outsourcing a part of the ZK proof generation of your transaction to a third party. For certain computationally constrained devices such as mobile phones and web browser environments, generating ZK proofs might take too long to ensure an acceptable user experience. Devices that do not have the computational resources to generate Miden proofs in under 1-2 seconds can use delegated proving to provide a more responsive user experience.
+Delegated proving moves transaction proof generation to a remote service. This can reduce the work required on a mobile device or in a browser. The time to submit a transaction still depends on execution, network latency, prover capacity, and node settlement.
 
-_How does it work?_ When a user choses to use delegated proving, they send off a portion of the zk proof of their transaction to a dedicated server. This dedicated server generates the remainder of the ZK proof of the transaction and submits it to the network. Submitting a transaction with delegated proving is trustless, meaning if the delegated prover is malicious, the could not compromise the security of the account that is submitting a transaction to be processed by the delegated prover. The downside of using delegated proving is that it reduces the privacy of the account that uses delegated proving, because the delegated prover would have knowledge of the transaction that is being proven. Additionally, transactions that require sensitive data such as the knowledge of a hash preimage or a secret, should not use delegated proving as this data will be shared with the delegated prover for proof generation.
+_How does it work?_ The client sends a transaction witness to the delegated prover, receives the generated proof, and submits the proven transaction to the node. The node verifies the proof. Delegation shares the witness with the prover, including private data needed for execution; use local proving when those inputs must remain on your device.
 
 Anyone can run their own delegated prover server. If you are building a product on Miden, it may make sense to run your own delegated prover server for your users. To run your own delegated proving server, follow the instructions here: https://crates.io/crates/miden-proving-service
 
@@ -42,7 +53,14 @@ proving service. This means your browser never has to generate the full ZK proof
 
 ## Step 1: Initialize your Next.js project
 
-Follow the [setup guide](./setup_guide.md#create-a-tutorial-project) to create the Next.js app and install the SDK. Once the project is ready, keep your terminal in the `miden-web-app` directory for the remaining steps.
+1. Create the Next.js project by following [Create a tutorial project](./setup_guide.md#create-a-tutorial-project) in the setup guide. Keep your terminal in that directory for the remaining steps.
+
+2. Install the Miden SDK:
+
+<CodeSdkTabs example={{
+  react: { code: `yarn add @miden-sdk/react@0.17.0 @miden-sdk/miden-sdk@0.17.1` },
+  typescript: { code: `yarn add @miden-sdk/miden-sdk@0.17.1` },
+}} reactFilename="" tsFilename="" />
 
 ## Step 2: Edit the `app/page.tsx` file:
 
@@ -105,27 +123,30 @@ export default function Home() {
 
 Create `lib/react/multiSendWithDelegatedProver.tsx` (React) or `lib/multiSendWithDelegatedProver.ts` (TypeScript) and add the following code. This snippet initializes the Miden client.
 
-```
-mkdir -p lib
+```bash
+mkdir -p lib/react
 ```
 
 <CodeSdkTabs example={{
 react: { code: `'use client';
 
-import { MidenProvider, useMiden, useCreateWallet, useCreateFaucet, useMint, useConsume, useMultiSend, useWaitForCommit, useWaitForNotes } from '@miden-sdk/react/lazy';
+import { MidenProvider, useMiden, useCreateWallet, useCreateFaucet, useMint, useConsume, useMultiSend } from '@miden-sdk/react/lazy';
+import {tutorialAuthScheme, useTutorialSupport} from './tutorialSupport';
 import { NoteVisibility, StorageMode } from '@miden-sdk/miden-sdk/lazy';
 
 function MultiSendInner() {
-.const { isReady } = useMiden();
+.const { isReady, sync } = useMiden();
 .const { createWallet } = useCreateWallet();
 .const { createFaucet } = useCreateFaucet();
 .const { mint } = useMint();
 .const { consume } = useConsume();
 .const { sendMany } = useMultiSend();
-.const { waitForCommit } = useWaitForCommit();
-.const { waitForConsumableNotes } = useWaitForNotes();
+.const { fundAccount, committed, waitForTokenNotes, assertBalance } =
+..useTutorialSupport();
 
 .const run = async () => {
+..await sync();
+..const authScheme = await tutorialAuthScheme();
 ..// We'll add our logic here
 .};
 
@@ -148,11 +169,12 @@ export default function MultiSendWithDelegatedProver() {
   typescript: { code:`import {
 .MidenClient,
 .NoteVisibility,
+.FaucetType,
 .StorageMode,
 .createP2IDNote,
 .NoteArray,
-.TransactionRequestBuilder,
 } from '@miden-sdk/miden-sdk/lazy';
+import { fundAccountForFees, consumeAllFeeAware } from './feeSupport';
 
 export async function multiSendWithDelegatedProver(): Promise<void> {
 .// Ensure this runs only in a browser context
@@ -161,9 +183,7 @@ export async function multiSendWithDelegatedProver(): Promise<void> {
 .// Wait for WASM to be ready before touching any wasm-bindgen type.
 .await MidenClient.ready();
 
-.const client = await MidenClient.create({
-..rpcUrl: 'https://rpc.testnet.miden.io',
-.});
+.const client = await MidenClient.createTestnet();
 
 .console.log('Latest block:', (await client.sync()).blockNum());
 }` },
@@ -171,17 +191,18 @@ export async function multiSendWithDelegatedProver(): Promise<void> {
 
 ## Step 4 — Create an account, deploy a faucet, mint and consume tokens
 
-Add the code snippet below to the function. This code creates a wallet and faucet, mints tokens from the faucet for the wallet, and then consumes the minted tokens.
+Add the code below to the function. The shared helpers imported in Step 3 fund Alice and the faucet with native fee tokens, wait for confirmation and select the tutorial notes before consuming them. The React helpers come from the same `tutorialSupport` file used by the complete example.
 
 <CodeSdkTabs example={{
 react: { code: `// 1. Create Alice's wallet
 console.log('Creating account for Alice…');
-const alice = await createWallet({ storageMode: StorageMode.Public });
+const alice = await createWallet({ storageMode: StorageMode.Public, authScheme });
 const aliceId = alice.id().toString();
 console.log('Alice account ID:', aliceId);
 
 // 2. Deploy a fungible faucet
 const faucet = await createFaucet({
+.authScheme,
 .tokenSymbol: 'MID',
 .decimals: 8,
 .maxSupply: BigInt(1_000_000),
@@ -189,6 +210,8 @@ const faucet = await createFaucet({
 });
 const faucetId = faucet.id().toString();
 console.log('Faucet ID:', faucetId);
+await fundAccount(alice);
+await fundAccount(faucet);
 
 // 3. Mint 10,000 MID to Alice
 const mintResult = await mint({
@@ -199,11 +222,13 @@ const mintResult = await mint({
 });
 
 console.log('Waiting for settlement…');
-await waitForCommit(mintResult.transactionId);
+await committed(mintResult.transactionId);
 
 // 4. Consume the freshly minted notes
-const notes = await waitForConsumableNotes({ accountId: aliceId });
-await consume({ accountId: aliceId, notes });`},
+const notes = await waitForTokenNotes(alice, faucet);
+const consumed = await consume({ accountId: aliceId, notes });
+await committed(consumed.transactionId);
+await assertBalance(alice, faucet, BigInt(10_000));`},
   typescript: { code:`// ── Creating new account ──────────────────────────────────────────────────────
 console.log('Creating account for Alice…');
 const alice = await client.accounts.create({
@@ -213,13 +238,15 @@ console.log('Alice account ID:', alice.id().toString());
 
 // ── Creating new faucet ──────────────────────────────────────────────────────
 const faucet = await client.accounts.create({
-.type: 0, // 0 = FungibleFaucet
+.type: FaucetType.FungibleFaucet,
 .symbol: 'MID',
 .decimals: 8,
 .maxSupply: BigInt(1_000_000),
 .storage: StorageMode.Public,
 });
 console.log('Faucet ID:', faucet.id().toString());
+await fundAccountForFees(client, alice);
+await fundAccountForFees(client, faucet);
 
 // ── mint 10 000 MID to Alice ──────────────────────────────────────────────────────
 const { txId: mintTxId } = await client.transactions.mint({
@@ -230,38 +257,46 @@ const { txId: mintTxId } = await client.transactions.mint({
 });
 
 console.log('waiting for settlement');
-await client.transactions.waitFor(mintTxId);
+await client.transactions.waitFor(mintTxId, { timeout: 120_000 });
 
 // ── consume the freshly minted notes ──────────────────────────────────────────────
-await client.transactions.consumeAll({
-.account: alice,
-});` },
+await consumeAllFeeAware(client, alice);` },
 }} reactFilename="lib/react/multiSendWithDelegatedProver.tsx" tsFilename="lib/multiSendWithDelegatedProver.ts" />
 
 ## Step 5 — Build and Create P2ID notes
 
-Add the following code to the function. This code builds three P2ID notes with 100 `MID` each (one per hardcoded recipient address), and then creates all three notes in the same transaction.
+Add the following code to the function. This code creates three testnet recipients, builds a P2ID note with 100 `MID` for each, and then creates all three notes in the same transaction.
 
 <CodeSdkTabs example={{
-react: { code: `// 5. Send 100 MID to three recipients in a single transaction
-await sendMany({
+react: { code: `// 5. Create three recipients and send 100 MID to each in one transaction
+const recipients = await Promise.all(
+.Array.from({ length: 3 }, () =>
+..createWallet({ storageMode: StorageMode.Public, authScheme }),
+.),
+);
+
+const sent = await sendMany({
 .from: alice,
 .assetId: faucet,
-.recipients: [
-..{ to: 'mtst1arqeemdpnzu4k52wlpd3xekl5uklfjl5', amount: BigInt(100) },
-..{ to: 'mtst1arqk5qt3kms0cut9rdtqdaz8y5xmj245', amount: BigInt(100) },
-..{ to: 'mtst1aq6kyfrh23n9gvt6jkg0z7fyts99hdqr', amount: BigInt(100) },
-.],
+.recipients: recipients.map((account) => ({
+..to: account.id().toString(),
+..amount: BigInt(100),
+.})),
 .noteType: NoteVisibility.Public,
 });
 
+await committed(sent.transactionId);
+await assertBalance(alice, faucet, BigInt(9700));
 console.log('All notes created ✅');`},
   typescript: { code:`// ── build 3 P2ID notes (100 MID each) ─────────────────────────────────────────────
-const recipientAddresses = [
-.'mtst1arqeemdpnzu4k52wlpd3xekl5uklfjl5',
-.'mtst1arqk5qt3kms0cut9rdtqdaz8y5xmj245',
-.'mtst1aq6kyfrh23n9gvt6jkg0z7fyts99hdqr',
-];
+const recipients = await Promise.all(
+.Array.from({ length: 3 }, () =>
+..client.accounts.create({ storage: StorageMode.Public }),
+.),
+);
+const recipientAddresses = recipients.map((account) =>
+.account.id().toString(),
+);
 
 const p2idNotes = recipientAddresses.map((addr) =>
 .createP2IDNote({
@@ -273,9 +308,13 @@ const p2idNotes = recipientAddresses.map((addr) =>
 );
 
 // ── create all P2ID notes ───────────────────────────────────────────────────────────────
-const builder = new TransactionRequestBuilder();
-const txRequest = builder.withOwnOutputNotes(new NoteArray(p2idNotes)).build();
-await client.transactions.submit(alice, txRequest);
+await client.sync();
+const builder = await client.feeAwareTransactionRequestBuilder(alice);
+const outputs = new NoteArray();
+for (const note of p2idNotes) outputs.push(note);
+const txRequest = builder.withOwnOutputNotes(outputs).build();
+const { txId } = await client.transactions.submit(alice, txRequest);
+await client.transactions.waitFor(txId, { timeout: 120_000 });
 
 console.log('All notes created ✅');` },
 }} reactFilename="lib/react/multiSendWithDelegatedProver.tsx" tsFilename="lib/multiSendWithDelegatedProver.ts" />
@@ -287,107 +326,134 @@ Your library file should now look like this:
 <CodeSdkTabs example={{
 react: { code: `'use client';
 
-import { MidenProvider, useMiden, useCreateWallet, useCreateFaucet, useMint, useConsume, useMultiSend, useWaitForCommit, useWaitForNotes } from '@miden-sdk/react/lazy';
+import {
+.MidenProvider,
+.useMiden,
+.useCreateWallet,
+.useCreateFaucet,
+.useMint,
+.useConsume,
+.useMultiSend,
+} from '@miden-sdk/react/lazy';
 import { NoteVisibility, StorageMode } from '@miden-sdk/miden-sdk/lazy';
+import { tutorialNetwork } from '../feeSupport';
+import {
+.TutorialButton,
+.tutorialAuthScheme,
+.useTutorialSupport,
+} from './tutorialSupport';
 
 function MultiSendInner() {
-.const { isReady } = useMiden();
+.const { sync } = useMiden();
 .const { createWallet } = useCreateWallet();
 .const { createFaucet } = useCreateFaucet();
 .const { mint } = useMint();
 .const { consume } = useConsume();
 .const { sendMany } = useMultiSend();
-.const { waitForCommit } = useWaitForCommit();
-.const { waitForConsumableNotes } = useWaitForNotes();
+.const { fundAccount, committed, waitForTokenNotes, assertBalance } =
+..useTutorialSupport();
 
 .const run = async () => {
-..// 1. Create Alice's wallet
-..console.log('Creating account for Alice…');
-..const alice = await createWallet({ storageMode: StorageMode.Public });
-..const aliceId = alice.id().toString();
-..console.log('Alice account ID:', aliceId);
-
-..// 2. Deploy a fungible faucet
+..await sync();
+..const authScheme = await tutorialAuthScheme();
+..const alice = await createWallet({
+...storageMode: StorageMode.Public,
+...authScheme,
+..});
+..console.log('Alice ID:', alice.id().toString());
+..await fundAccount(alice);
 ..const faucet = await createFaucet({
 ...tokenSymbol: 'MID',
 ...decimals: 8,
 ...maxSupply: BigInt(1_000_000),
 ...storageMode: StorageMode.Public,
+...authScheme,
 ..});
-..const faucetId = faucet.id().toString();
-..console.log('Faucet ID:', faucetId);
+..console.log('Faucet ID:', faucet.id().toString());
+..await fundAccount(faucet);
 
-..// 3. Mint 10,000 MID to Alice
-..const mintResult = await mint({
-...faucetId,
-...targetAccountId: aliceId,
+..await sync();
+..const minted = await mint({
+...faucetId: faucet,
+...targetAccountId: alice,
 ...amount: BigInt(10_000),
 ...noteType: NoteVisibility.Public,
 ..});
+..await committed(minted.transactionId);
+..const notes = await waitForTokenNotes(alice, faucet);
+..const consumed = await consume({ accountId: alice.id().toString(), notes });
+..await committed(consumed.transactionId);
 
-..console.log('Waiting for settlement…');
-..await waitForCommit(mintResult.transactionId);
-
-..// 4. Consume the freshly minted notes
-..const notes = await waitForConsumableNotes({ accountId: aliceId });
-..await consume({ accountId: aliceId, notes });
-
-..// 5. Send 100 MID to three recipients in a single transaction
-..await sendMany({
+..const recipients = [];
+..for (let index = 0; index < 3; index += 1) {
+...recipients.push(
+....await createWallet({ storageMode: StorageMode.Public, authScheme }),
+...);
+..}
+..const sent = await sendMany({
 ...from: alice,
 ...assetId: faucet,
-...recipients: [
-....{ to: 'mtst1arqeemdpnzu4k52wlpd3xekl5uklfjl5', amount: BigInt(100) },
-....{ to: 'mtst1arqk5qt3kms0cut9rdtqdaz8y5xmj245', amount: BigInt(100) },
-....{ to: 'mtst1aq6kyfrh23n9gvt6jkg0z7fyts99hdqr', amount: BigInt(100) },
-...],
+...recipients: recipients.map((account) => ({
+....to: account,
+....amount: BigInt(100),
+...})),
 ...noteType: NoteVisibility.Public,
 ..});
-
+..await committed(sent.transactionId);
+..for (const recipient of recipients) {
+...const outputs = await waitForTokenNotes(recipient, faucet);
+...if (
+....outputs.length !== 1 ||
+....outputs[0].details().assets().fungibleAssets()[0]?.amount() !==
+.....BigInt(100)
+...) {
+....throw new Error(\`Expected one 100 MID note for \${recipient.id()}\`);
+...}
+..}
+..await assertBalance(alice, faucet, BigInt(9700));
 ..console.log('All notes created ✅');
 .};
 
 .return (
-..<div>
-...<button onClick={run} disabled={!isReady}>
-....{isReady ? 'Run: Multi-Send with Delegated Proving' : 'Initializing…'}
-...</button>
-..</div>
+..<TutorialButton
+...name="multiSendWithDelegatedProver"
+...label="Run: Multi-Send with Delegated Proving"
+...run={run}
+../>
 .);
 }
 
 export default function MultiSendWithDelegatedProver() {
 .return (
-..<MidenProvider config={{ rpcUrl: 'testnet', prover: 'testnet' }}>
+..<MidenProvider
+...config={{
+....rpcUrl: tutorialNetwork(),
+....prover: tutorialNetwork(),
+....autoSyncInterval: 0,
+...}}
+..>
 ...<MultiSendInner />
 ..</MidenProvider>
 .);
 }`},
-  typescript: { code:`import {
-.MidenClient,
+  typescript: { code: `import {
+.NoteArray,
 .NoteVisibility,
+.FaucetType,
 .StorageMode,
 .createP2IDNote,
-.NoteArray,
-.TransactionRequestBuilder,
 } from '@miden-sdk/miden-sdk/lazy';
+import {
+.consumeAllFeeAware,
+.createTutorialClient,
+.fundAccountForFees,
+} from './feeSupport';
 
-/\*\*
-.\* Demonstrates multi-send functionality with delegated proving on the Miden Network
-.\* Creates multiple P2ID (Pay to ID) notes for different recipients
-.\*
-.\* @throws {Error} If the function cannot be executed in a browser environment
-.\*/
 export async function multiSendWithDelegatedProver(): Promise<void> {
 .// Ensure this runs only in a browser context
 .if (typeof window === 'undefined') return console.warn('Run in browser');
 
-.// Wait for WASM to be ready before touching any wasm-bindgen type.
-.await MidenClient.ready();
-
-.const client = await MidenClient.create({
-..rpcUrl: 'https://rpc.testnet.miden.io',
-.});
+.const client = await createTutorialClient();
 
 .console.log('Latest block:', (await client.sync()).blockNum());
 
@@ -398,38 +464,39 @@ export async function multiSendWithDelegatedProver(): Promise<void> {
 .});
 .console.log('Alice account ID:', alice.id().toString());
 
-.// ── Creating new faucet ──────────────────────────────────────────────────────
+.// ── Creating new faucet ────────────────────────────────────────────────────
 .const faucet = await client.accounts.create({
-..type: 0, // 0 = FungibleFaucet
+..type: FaucetType.FungibleFaucet,
 ..symbol: 'MID',
 ..decimals: 8,
 ..maxSupply: BigInt(1_000_000),
 ..storage: StorageMode.Public,
 .});
 .console.log('Faucet ID:', faucet.id().toString());
+.await fundAccountForFees(client, alice);
+.await fundAccountForFees(client, faucet);
 
-.// ── mint 10 000 MID to Alice ──────────────────────────────────────────────────────
+.// ── mint 10 000 MID to Alice ───────────────────────────────────────────────
+.await client.sync();
 .const { txId: mintTxId } = await client.transactions.mint({
 ..account: faucet,
 ..to: alice,
 ..amount: BigInt(10_000),
 ..type: NoteVisibility.Public,
 .});
-
 .console.log('waiting for settlement');
-.await client.transactions.waitFor(mintTxId);
-
-.// ── consume the freshly minted notes ──────────────────────────────────────────────
-.await client.transactions.consumeAll({
-..account: alice,
-.});
+.await client.transactions.waitFor(mintTxId, { timeout: 120_000 });
+.await consumeAllFeeAware(client, alice);
 
 .// ── build 3 P2ID notes (100 MID each) ─────────────────────────────────────────────
-.const recipientAddresses = [
-..'mtst1arqeemdpnzu4k52wlpd3xekl5uklfjl5',
-..'mtst1arqk5qt3kms0cut9rdtqdaz8y5xmj245',
-..'mtst1aq6kyfrh23n9gvt6jkg0z7fyts99hdqr',
-.];
+.const recipients = await Promise.all(
+..Array.from({ length: 3 }, () =>
+...client.accounts.create({ storage: StorageMode.Public }),
+..),
+.);
+.const recipientAddresses = recipients.map((account) =>
+..account.id().toString(),
+.);
 
 .const p2idNotes = recipientAddresses.map((addr) =>
 ..createP2IDNote({
@@ -441,9 +508,18 @@ export async function multiSendWithDelegatedProver(): Promise<void> {
 .);
 
 .// ── create all P2ID notes ───────────────────────────────────────────────────────────────
-.const builder = new TransactionRequestBuilder();
-.const txRequest = builder.withOwnOutputNotes(new NoteArray(p2idNotes)).build();
-.await client.transactions.submit(alice, txRequest);
+.await client.sync();
+.const builder = await client.feeAwareTransactionRequestBuilder(alice);
+.const outputs = new NoteArray();
+.for (const note of p2idNotes) outputs.push(note);
+.const request = builder.withOwnOutputNotes(outputs).build();
+.const { txId } = await client.transactions.submit(alice, request);
+.await client.transactions.waitFor(txId, { timeout: 120_000 });
+.console.log(\`Transaction committed: \${txId.toHex()}\`);
+.const updatedAlice = await client.accounts.get(alice);
+.const balance = updatedAlice?.vault().getBalance(faucet.id());
+.if (balance !== BigInt(9_700))
+..throw new Error(\`Expected Alice to retain 9700 MID, got \${balance}\`);
 
 .console.log('All notes created ✅');
 }` },
@@ -456,20 +532,23 @@ To run a full working example navigate to the `web-client` directory in the [mid
 ```bash
 cd web-client
 yarn install
-yarn start
+yarn dev
 ```
 
 ### Resetting the `MidenClientDB`
 
-The Miden webclient stores account and note data in the browser. To clear the account and node data in the browser, paste this code snippet into the browser console:
+The Miden webclient stores account and note data in IndexedDB. Stop or terminate the tutorial client and close other tabs using its store before resetting it. This deletes local account data and keys, so use it only for disposable tutorial accounts. The following browser-console snippet deletes the default testnet `MidenClientDB_mtst` store after the deletion request completes; change `name` if you configured a different store.
 
 ```javascript
 (async () => {
-  const dbs = await indexedDB.databases(); // Get all database names
-  for (const db of dbs) {
-    await indexedDB.deleteDatabase(db.name);
-    console.log(`Deleted database: ${db.name}`);
-  }
-  console.log('All databases deleted.');
+  const name = 'MidenClientDB_mtst';
+  await new Promise((resolve, reject) => {
+    const request = indexedDB.deleteDatabase(name);
+    request.onsuccess = () => resolve();
+    request.onerror = () => reject(request.error);
+    request.onblocked = () =>
+      reject(new Error('Close clients and tabs using this store, then retry.'));
+  });
+  console.log(`Deleted database: ${name}`);
 })();
 ```

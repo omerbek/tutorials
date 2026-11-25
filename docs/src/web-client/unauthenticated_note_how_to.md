@@ -7,15 +7,24 @@ import { CodeSdkTabs } from '@site/src/components';
 
 _Using unauthenticated notes for optimistic note consumption with the Miden client_
 
+:::note v0.17 setup
+
+Follow the [network and fee setup](./setup_guide.md#network-and-fee-setup)
+and copy the shared support files imported by the complete example.
+For React snippets, initialize `authScheme` with `await tutorialAuthScheme()`
+as shown in the complete example.
+
+:::
+
 ## Overview
 
-In this tutorial, we will explore how to leverage unauthenticated notes on Miden to settle transactions faster than the blocktime using the Miden client. Unauthenticated notes are essentially UTXOs that have not yet been fully committed into a block. This feature allows the notes to be created and consumed within the same batch during [batch production](https://0xmiden.github.io/miden-docs/imported/miden-base/src/blockchain.html#batch-production).
+This tutorial passes newly created P2ID notes directly to the next consumer. An unauthenticated input contains the full note without an inclusion proof. The transaction kernel delegates verification of the note's existence to the protocol kernels, allowing the consumer transaction to execute before the producer transaction is confirmed. Final settlement still requires verification by the network.
 
-When using unauthenticated notes, both the creation and consumption of notes can happen within the same batch, enabling faster-than-blocktime settlement. This is particularly powerful for applications requiring high-frequency transactions or optimistic settlement patterns.
+The Web and React SDKs choose the input mode from the executing client's store: they use an authenticated input when an inclusion proof is available and an unauthenticated input otherwise. Passing a full `Note` supports unauthenticated consumption but does not force that mode; synchronization can make an inclusion proof available.
 
-We construct a chain of transactions using the unauthenticated notes method on the transaction builder. Unauthenticated notes are also referred to as "erasable notes". We also demonstrate how a note can be created and consumed, highlighting the ability to transfer notes between client instances for asset transfers that can be settled between parties faster than the blocktime.
+The example uses one client to manage Alice and five recipient wallets. At each hop, it submits the consumer transaction before waiting for the sender's confirmation, then waits for both transactions before advancing to the next wallet. It verifies the resulting balances; it does not measure transaction latency or guarantee that both transactions settle in the same batch.
 
-For example, our demo creates a chain of unauthenticated note transactions:
+The asset follows this chain:
 
 ```markdown
 Alice ➡ Wallet 1 ➡ Wallet 2 ➡ Wallet 3 ➡ Wallet 4 ➡ Wallet 5
@@ -26,11 +35,13 @@ Alice ➡ Wallet 1 ➡ Wallet 2 ➡ Wallet 3 ➡ Wallet 4 ➡ Wallet 5
 - **Introduction to Unauthenticated Notes:** Understand what unauthenticated notes are and how they differ from standard notes.
 - **Miden Client Setup:** Configure the Miden client for browser-based transactions.
 - **P2ID Note Creation:** Learn how to create Pay-to-ID notes for targeted transfers.
-- **Performance Insights:** Observe how unauthenticated notes can reduce transaction times dramatically.
+- **Confirmation Boundaries:** Distinguish optimistic execution from confirmed settlement.
 
 ## Prerequisites
 
-Complete the [Web Client Setup Guide](./setup_guide.md) before starting. It covers the Node.js version, package manager, SDK install, and Next.js configuration used by this tutorial.
+- Node `v20.9.0` or greater (required by the current Next.js template)
+- Familiarity with TypeScript
+- `yarn`
 
 This tutorial assumes you have a basic understanding of Miden assembly. To quickly get up to speed with Miden assembly (MASM), please play around with running basic Miden assembly programs in the [Miden playground](https://0xmiden.github.io/examples/).
 
@@ -41,7 +52,7 @@ This tutorial assumes you have a basic understanding of Miden assembly. To quick
    - Install the Miden SDK.
 
 2. **Client Initialization:**
-   - Set up the Miden client to connect with the Miden testnet.
+   - Set up the Miden client to connect with Miden testnet.
 
 3. **Account Creation:**
    - Create wallet accounts for Alice and multiple transfer recipients.
@@ -53,12 +64,19 @@ This tutorial assumes you have a basic understanding of Miden assembly. To quick
 
 5. **Unauthenticated Note Transfer Chain:**
    - Create P2ID (Pay-to-ID) notes for each transfer in the chain.
-   - Use unauthenticated input notes to consume notes faster than blocktime.
-   - Measure and observe the performance benefits.
+   - Pass each full output note directly to the next consumer.
+   - Wait for both transactions to be confirmed and verify the balances.
 
 ## Step 1: Initialize your Next.js project
 
-Follow the [setup guide](./setup_guide.md#create-a-tutorial-project) to create the Next.js app and install the SDK. Once the project is ready, keep your terminal in the `miden-web-app` directory for the remaining steps.
+1. Create the Next.js project by following [Create a tutorial project](./setup_guide.md#create-a-tutorial-project) in the setup guide. Keep your terminal in that directory for the remaining steps.
+
+2. Install the Miden SDK:
+
+<CodeSdkTabs example={{
+  react: { code: `yarn add @miden-sdk/react@0.17.0 @miden-sdk/miden-sdk@0.17.1` },
+  typescript: { code: `yarn add @miden-sdk/miden-sdk@0.17.1` },
+}} reactFilename="" tsFilename="" />
 
 ## Step 2: Edit the `app/page.tsx` file
 
@@ -122,7 +140,7 @@ export default function Home() {
 Create the library file and add the following code:
 
 ```bash
-mkdir -p lib
+mkdir -p lib/react
 ```
 
 Copy and paste the following code into `lib/react/unauthenticatedNoteTransfer.tsx` (React) or `lib/unauthenticatedNoteTransfer.ts` (TypeScript):
@@ -130,63 +148,80 @@ Copy and paste the following code into `lib/react/unauthenticatedNoteTransfer.ts
 <CodeSdkTabs example={{
 react: { code: `'use client';
 
-import { MidenProvider, useMiden, useCreateWallet, useCreateFaucet, useMint, useConsume, useSend, useWaitForCommit, useWaitForNotes } from '@miden-sdk/react/lazy';
+import {
+.MidenProvider,
+.useMiden,
+.useCreateWallet,
+.useCreateFaucet,
+.useMint,
+.useConsume,
+.useSend,
+.type Account,
+} from '@miden-sdk/react/lazy';
 import { NoteVisibility, StorageMode } from '@miden-sdk/miden-sdk/lazy';
+import { tutorialExplorerUrl, tutorialNetwork } from '../feeSupport';
+import {
+.TutorialButton,
+.tutorialAuthScheme,
+.useTutorialSupport,
+} from './tutorialSupport';
 
 function UnauthenticatedNoteTransferInner() {
-.const { isReady } = useMiden();
+.const { sync } = useMiden();
 .const { createWallet } = useCreateWallet();
 .const { createFaucet } = useCreateFaucet();
 .const { mint } = useMint();
 .const { consume } = useConsume();
 .const { send } = useSend();
-.const { waitForCommit } = useWaitForCommit();
-.const { waitForConsumableNotes } = useWaitForNotes();
+.const { fundAccount, committed, waitForTokenNotes, assertBalance } =
+..useTutorialSupport();
 
 .const run = async () => {
-..// 1. Create Alice and 5 wallets for the transfer chain
-..console.log('Creating accounts…');
-..const alice = await createWallet({ storageMode: StorageMode.Public });
-..console.log('Alice account ID:', alice.id().toString());
-
-..const wallets = [];
-..for (let i = 0; i < 5; i++) {
-...const wallet = await createWallet({ storageMode: StorageMode.Public });
+..await sync();
+..const authScheme = await tutorialAuthScheme();
+..const alice = await createWallet({
+...storageMode: StorageMode.Public,
+...authScheme,
+..});
+..console.log('Alice ID:', alice.id().toString());
+..await fundAccount(alice);
+..const wallets: Account[] = [];
+..for (let index = 0; index < 5; index += 1) {
+...const wallet = await createWallet({
+....storageMode: StorageMode.Public,
+....authScheme,
+...});
+...console.log(\`Wallet \${index}:\`, wallet.id().toString());
+...// Every recipient pays fees when consuming and forwarding the note.
+...await fundAccount(wallet);
 ...wallets.push(wallet);
-...console.log(\`Wallet \${i}:\`, wallet.id().toString());
 ..}
-
-..// 2. Deploy a fungible faucet
 ..const faucet = await createFaucet({
 ...tokenSymbol: 'MID',
 ...decimals: 8,
 ...maxSupply: BigInt(1_000_000),
 ...storageMode: StorageMode.Public,
+...authScheme,
 ..});
 ..console.log('Faucet ID:', faucet.id().toString());
-
-..// 3. Mint 10,000 MID to Alice
-..const mintResult = await mint({
+..await fundAccount(faucet);
+..await sync();
+..const minted = await mint({
 ...faucetId: faucet,
 ...targetAccountId: alice,
 ...amount: BigInt(10_000),
 ...noteType: NoteVisibility.Public,
 ..});
+..await committed(minted.transactionId);
+..const notes = await waitForTokenNotes(alice, faucet);
+..const consumed = await consume({ accountId: alice.id().toString(), notes });
+..await committed(consumed.transactionId);
 
-..console.log('Waiting for settlement…');
-..await waitForCommit(mintResult.transactionId);
-
-..// 4. Consume the freshly minted notes
-..const notes = await waitForConsumableNotes({ accountId: alice });
-..await consume({ accountId: alice.id().toString(), notes });
-
-..// 5. Create the unauthenticated note transfer chain:
-..// Alice → Wallet 0 → Wallet 1 → Wallet 2 → Wallet 3 → Wallet 4
-..console.log('Starting unauthenticated transfer chain…');
+..// Pass full Note objects directly, without fetching an inclusion proof.
 ..let currentSender = alice;
-..for (let i = 0; i < wallets.length; i++) {
-...const wallet = wallets[i];
-...const { note } = await send({
+..for (let index = 0; index < wallets.length; index += 1) {
+...const wallet = wallets[index];
+...const sent = await send({
 ....from: currentSender,
 ....to: wallet,
 ....assetId: faucet,
@@ -194,58 +229,66 @@ function UnauthenticatedNoteTransferInner() {
 ....noteType: NoteVisibility.Public,
 ....returnNote: true,
 ...});
-...const result = await consume({ accountId: wallet.id().toString(), notes: [note] });
+...if (!sent.note) throw new Error('Send did not return its output note');
+...const received = await consume({
+....accountId: wallet.id().toString(),
+....notes: [sent.note],
+...});
+...await committed(sent.txId);
+...await committed(received.transactionId);
+...await assertBalance(wallet, faucet, BigInt(50));
 ...console.log(
-....\`Transfer \${i + 1}: https://testnet.midenscan.com/tx/\${result.transactionId}\`,
+....\`Transfer \${index + 1}: \${tutorialExplorerUrl()}/tx/\${received.transactionId}\`,
 ...);
 ...currentSender = wallet;
 ..}
-
+..await assertBalance(alice, faucet, BigInt(9950));
+..for (const wallet of wallets.slice(0, -1))
+...await assertBalance(wallet, faucet, BigInt(0));
 ..console.log('Asset transfer chain completed ✅');
 .};
 
 .return (
-..<div>
-...<button onClick={run} disabled={!isReady}>
-....{isReady ? 'Run: Unauthenticated Note Transfer' : 'Initializing…'}
-...</button>
-..</div>
+..<TutorialButton
+...name="unauthenticatedNoteTransfer"
+...label="Run: Unauthenticated Note Transfer"
+...run={run}
+../>
 .);
 }
 
 export default function UnauthenticatedNoteTransfer() {
 .return (
-..<MidenProvider config={{ rpcUrl: 'testnet', prover: 'local' }}>
+..<MidenProvider
+...config={{
+....rpcUrl: tutorialNetwork(),
+....prover: tutorialNetwork(),
+....autoSyncInterval: 0,
+...}}
+..>
 ...<UnauthenticatedNoteTransferInner />
 ..</MidenProvider>
 .);
 }`},
-  typescript: { code:`import {
-.MidenClient,
-.NoteVisibility,
-.StorageMode,
-} from '@miden-sdk/miden-sdk/lazy';
+  typescript: { code: `import { FaucetType, NoteVisibility, StorageMode } from '@miden-sdk/miden-sdk/lazy';
+import {
+.consumeAllFeeAware,
+.createTutorialClient,
+.fundAccountForFees,
+.tutorialExplorerUrl,
+} from './feeSupport';
 
-/\*\*
-.\* Demonstrates unauthenticated note transfer chain against Miden testnet
-.\* Creates a chain of P2ID (Pay to ID) notes: Alice → wallet 1 → wallet 2 → wallet 3 → wallet 4
-.\*
-.\* @throws {Error} If the function cannot be executed in a browser environment
-.\*/
 export async function unauthenticatedNoteTransfer(): Promise<void> {
 .// Ensure this runs only in a browser context
 .if (typeof window === 'undefined') return console.warn('Run in browser');
 
-.// Wait for WASM to be ready before touching any wasm-bindgen type.
-.await MidenClient.ready();
-
-.const client = await MidenClient.create({
-..rpcUrl: 'https://rpc.testnet.miden.io',
-.});
+.const client = await createTutorialClient();
 
 .console.log('Latest block:', (await client.sync()).blockNum());
 
-.// ── Creating accounts ──────────────────────────────────────────────────────
+.// ── Creating new account ──────────────────────────────────────────────────────
+.console.log('Creating accounts');
+
 .console.log('Creating account for Alice…');
 .const alice = await client.accounts.create({
 ..storage: StorageMode.Public,
@@ -261,31 +304,31 @@ export async function unauthenticatedNoteTransfer(): Promise<void> {
 ..console.log('wallet ', i.toString(), wallet.id().toString());
 .}
 
-.// ── Creating new faucet ──────────────────────────────────────────────────────
 .const faucet = await client.accounts.create({
-..type: 0, // 0 = FungibleFaucet
+..type: FaucetType.FungibleFaucet,
 ..symbol: 'MID',
 ..decimals: 8,
 ..maxSupply: BigInt(1_000_000),
 ..storage: StorageMode.Public,
 .});
 .console.log('Faucet ID:', faucet.id().toString());
+.await fundAccountForFees(client, alice);
+.await fundAccountForFees(client, faucet);
 
-.// ── Mint 10,000 MID to Alice ──────────────────────────────────────────────────────
+.await client.sync();
 .const { txId: mintTxId } = await client.transactions.mint({
 ..account: faucet,
 ..to: alice,
 ..amount: BigInt(10_000),
 ..type: NoteVisibility.Public,
 .});
-
 .console.log('Waiting for settlement');
-.await client.transactions.waitFor(mintTxId);
+.await client.transactions.waitFor(mintTxId, { timeout: 120_000 });
+.await consumeAllFeeAware(client, alice);
 
-.// ── Consume the freshly minted note ──────────────────────────────────────────────
-.await client.transactions.consumeAll({
-..account: alice,
-.});
+.for (const wallet of wallets) {
+..await fundAccountForFees(client, wallet);
+.}
 
 .// ── Create unauthenticated note transfer chain ─────────────────────────────────────────────
 .// Alice → wallet 1 → wallet 2 → wallet 3 → wallet 4
@@ -298,25 +341,37 @@ export async function unauthenticatedNoteTransfer(): Promise<void> {
 ..console.log('Sender:', sender.id().toString());
 ..console.log('Receiver:', receiver.id().toString());
 
-..const { note } = await client.transactions.send({
+..await client.sync();
+..const { note, txId: sendTxId } = await client.transactions.send({
 ...account: sender,
 ...to: receiver,
 ...token: faucet,
 ...amount: BigInt(50),
 ...type: NoteVisibility.Public,
 ...returnNote: true,
+...waitForConfirmation: false,
 ..});
 
+..// Pass the full note before waiting for the sender's transaction.
+..await client.sync();
 ..const { txId: consumeTxId } = await client.transactions.consume({
 ...account: receiver,
 ...notes: [note],
+...waitForConfirmation: true,
+...timeout: 120_000,
 ..});
+..await client.transactions.waitFor(sendTxId, { timeout: 120_000 });
+..console.log(\`Transaction committed: \${consumeTxId.toHex()}\`);
 
 ..console.log(
-...\`Consumed Note Tx on MidenScan: https://testnet.midenscan.com/tx/\${consumeTxId.toHex()}\`,
+...\`Consumed Note Tx on MidenScan: \${tutorialExplorerUrl()}/tx/\${consumeTxId.toHex()}\`,
 ..);
 .}
 
+.const lastWallet = await client.accounts.get(wallets[wallets.length - 1]);
+.const balance = lastWallet?.vault().getBalance(faucet.id());
+.if (balance !== BigInt(50))
+..throw new Error(\`Expected last wallet to hold 50 MID, got \${balance}\`);
 .console.log('Asset transfer chain completed ✅');
 }` },
 }} reactFilename="lib/react/unauthenticatedNoteTransfer.tsx" tsFilename="lib/unauthenticatedNoteTransfer.ts" />
@@ -328,7 +383,7 @@ export async function unauthenticatedNoteTransfer(): Promise<void> {
 Unauthenticated notes are a powerful feature that allows notes to be:
 
 - **Created and consumed in the same block**
-- **Transferred faster than blocktime**
+- **Passed to a consuming transaction before block confirmation**
 - **Used for optimistic transactions**
 
 ### Performance Benefits
@@ -336,8 +391,8 @@ Unauthenticated notes are a powerful feature that allows notes to be:
 By using unauthenticated notes, we can:
 
 - Skip waiting for block confirmation between note creation and consumption
-- Create transaction chains that execute within a single block
-- Achieve sub-blocktime settlement for certain use cases
+- Submit dependent transaction chains that may be included in a single block
+- Begin dependent execution earlier; final settlement still requires network confirmation
 
 ### Use Cases
 
@@ -346,7 +401,7 @@ Unauthenticated notes are ideal for:
 - **High-frequency trading applications**
 - **Payment channels**
 - **Micropayment systems**
-- **Any scenario requiring fast settlement**
+- **Applications that benefit from optimistic execution before confirmation**
 
 ## Running the Example
 
@@ -391,27 +446,30 @@ Asset transfer chain completed ✅
 
 ## Conclusion
 
-Unauthenticated notes on Miden offer a powerful mechanism for achieving faster asset settlements by allowing notes to be both created and consumed within the same block. In this guide, we walked through:
+Unauthenticated notes let applications submit dependent transactions without first waiting for the producer's confirmation. Creation and consumption may be included in the same block; this does not provide settlement before block production. In this guide, we walked through:
 
 - **Setting up the Miden client** against testnet
 - **Creating P2ID Notes** for targeted asset transfers between specific accounts
-- **Building Transaction Chains** using unauthenticated input notes for sub-blocktime settlement
-- **Performance Observations** demonstrating how unauthenticated notes enable faster-than-blocktime transfers
+- **Building Transaction Chains** that submit consumption before waiting for the producer's confirmation
+- **Confirmation and balance checks** for the complete transfer chain
 
 By following this guide, you should now have a clear understanding of how to build and deploy high-performance transactions using unauthenticated notes on Miden with the Miden client. Unauthenticated notes are the ideal approach for applications like central limit order books (CLOBs) or other DeFi platforms where transaction speed is critical.
 
 ### Resetting the `MidenClientDB`
 
-The Miden webclient stores account and note data in the browser. If you get errors such as "Failed to build MMR", then you should reset the Miden webclient store. When switching between Miden networks such as from localhost to testnet be sure to reset the browser store. To clear the account and node data in the browser, paste this code snippet into the browser console:
+Stop or terminate the tutorial client and close other tabs using its store before resetting it. This deletes local account data and keys, so use it only for disposable tutorial accounts. The snippet below waits for deletion of the default testnet store; change `name` if you configured a different store.
 
 ```javascript
 (async () => {
-  const dbs = await indexedDB.databases();
-  for (const db of dbs) {
-    await indexedDB.deleteDatabase(db.name);
-    console.log(`Deleted database: ${db.name}`);
-  }
-  console.log('All databases deleted.');
+  const name = 'MidenClientDB_mtst';
+  await new Promise((resolve, reject) => {
+    const request = indexedDB.deleteDatabase(name);
+    request.onsuccess = () => resolve();
+    request.onerror = () => reject(request.error);
+    request.onblocked = () =>
+      reject(new Error('Close clients and tabs using this store, then retry.'));
+  });
+  console.log(`Deleted database: ${name}`);
 })();
 ```
 
@@ -422,7 +480,7 @@ To run a full working example navigate to the `web-client` directory in the [mid
 ```bash
 cd web-client
 yarn install
-yarn start
+yarn dev
 ```
 
 ### Continue learning
